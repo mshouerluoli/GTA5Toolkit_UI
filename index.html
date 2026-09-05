@@ -22,7 +22,7 @@
   ::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,.30); }
 
   body {
-    font-family:"GTAFont", "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-family:"GTAFont";
     background:#0d1117 url('img/bg.jpeg') center/cover no-repeat fixed;
     color:#e6edf3;
     height:100vh; overflow:hidden; user-select:none;
@@ -174,7 +174,7 @@
 <body>
 <div class="app">
   <div class="banner" id="topBar">
-    <span class="bt">GTA5 Toolkit</span> <small> </small>
+    <span class="bt">GTA5 Toolkit</span> <small id="connStatus"></small>
     <div class="window-controls">
       <button class="window-btn minimize" id="minimizeBtn"><i></i></button>
       <button class="window-btn maximize" id="maximizeBtn"><i></i></button>
@@ -385,7 +385,7 @@ function renderLogs(list){
   // 空日志：不显示任何提示，直接留白
   if (g_logs.length===0){ return; }
   const pre=document.createElement("div");
-  pre.style.cssText="white-space:pre-wrap; word-break:break-all; font-family:Consolas,Menlo,monospace; font-size:12px; line-height:1.5; color:#9ae6b4; padding:10px; background:rgba(0,0,0,.35); border-radius:8px; border:1px solid rgba(255,255,255,.08);";
+  pre.style.cssText="white-space:pre-wrap; word-break:break-all; font-family:'GTAFont'; font-size:12px; line-height:1.5; color:#9ae6b4; padding:10px; background:rgba(0,0,0,.35); border-radius:8px; border:1px solid rgba(255,255,255,.08);";
   pre.textContent=g_logs.join("\n");
   list.appendChild(pre);
 }
@@ -442,13 +442,71 @@ if (topBar){
 
 function renderAll(){ renderSidebar(); renderPanel(); }
 
-// ============ WebView2 桥接 ============
+// ============ 通信层 ============
+// 分工：
+//   · 业务消息（init / command / spawnVehicle）→ WebSocket 直连游戏进程内的 DLL
+//   · 窗口控制（minimize / maximize / close / move）→ 仍走 WebView2 宿主桥接
+//     （窗口是宿主的，游戏里的 DLL 管不了浏览器/宿主窗口，所以这条不动）
+const WS_PORT = 9002;
+
+let ws = null;
+let wsTimer = null;
+let wsAutoReconnect = true;
+let wsConnected = false;
+
+function isHost(){
+  return !!(window.chrome && window.chrome.webview && window.chrome.webview.postMessage);
+}
+function postToHost(text){
+  if (isHost()) window.chrome.webview.postMessage(text);
+}
+
+// 顶栏右上角的状态灯
+function setConn(text, color){
+  const el = document.getElementById("connStatus");
+  if (!el) return;
+  el.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;'+
+                 'background:'+color+';margin-right:6px;vertical-align:middle;'+
+                 'box-shadow:0 0 6px '+color+';"></span>'+text;
+}
+
+function wsConnect(){
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  setConn("连接中…", "#f59e0b");
+
+  let sock;
+  try { sock = new WebSocket("ws://127.0.0.1:" + WS_PORT + "/"); }
+  catch (err){ setConn("地址错误", "#ef4444"); return; }
+
+  ws = sock;
+  sock.onopen = ()=>{ wsConnected = true; setConn("已连接 " + WS_PORT, "#22c55e"); };
+  sock.onmessage = (ev)=> onBackendMessage(ev.data);
+  sock.onerror = ()=>{ wsConnected = false; setConn("连接错误", "#ef4444"); };
+  sock.onclose = ()=>{
+    wsConnected = false;
+    setConn("未连接", "#8b98a8");
+    if (ws === sock) ws = null;
+    if (wsAutoReconnect && !wsTimer){
+      wsTimer = setTimeout(()=>{ wsTimer = null; wsConnect(); }, 2000);
+    }
+  };
+}
+
+// 所有对外发送统一走这里
 function send(cmd, payload){
-  const msg={ cmd, payload };
-  if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage){
-    window.chrome.webview.postMessage(JSON.stringify(msg));
+  const text = JSON.stringify({ cmd, payload });
+
+  // 窗口控制：维持原 WebView2 通道不变
+  if (cmd === "windowControl"){
+    postToHost(text);
+    return;
+  }
+
+  // 业务消息：走 WebSocket
+  if (ws && ws.readyState === WebSocket.OPEN){
+    ws.send(text);
   } else {
-    console.log("[bridge]", JSON.stringify(msg));
+    console.log("[ws] 未连接，消息未发送:", text);
   }
 }
 
@@ -462,6 +520,14 @@ function setInitBtn(label, cls){
   initBtn.className = "init-btn" + (cls ? " "+cls : "");
 }
 function doInit(){
+  // 没连上游戏时先尝试连一次，别让用户干等 5 秒超时
+  if (!(ws && ws.readyState === WebSocket.OPEN)){
+    wsConnect();
+    initState = "fail";
+    setInitBtn("未连接游戏", "fail");
+    setTimeout(()=>{ if (initState === "fail") setInitBtn("初始化", ""); }, 1600);
+    return;
+  }
   if (initState === "init") return;  // 防止重复触发
   initState = "init";
   setInitBtn("初始化中…", "busy");
@@ -509,7 +575,11 @@ if (searchInput){
 }
 
 renderAll();
-console.log("[ui ready] GTA5 Toolkit HTML UI");
+
+// 启动 WebSocket（业务消息通道）；窗口控制仍由 WebView2 宿主处理
+setConn("未连接", "#8b98a8");
+wsConnect();
+console.log("[ui ready] GTA5 Toolkit HTML UI (WebSocket 通道)");
 </script>
 </body>
 </html>
